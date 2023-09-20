@@ -1,9 +1,42 @@
 #include <stdio.h>
 #include "csapp.h"
 
+
+
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
+
+// 양방향으로 캐쉬를 구현해볼것이다.
+typedef struct Node_t{
+    char uri[MAXLINE];
+    char response_data[MAX_OBJECT_SIZE];
+    size_t data_size;
+    struct Node_t *next;
+    struct Node_t *prev;
+} Node_t;
+
+typedef struct doublyList{
+    struct Node_t *head;
+    struct Node_t *tail;
+    size_t total_data_size;
+}mylist;
+
+Node_t* createNode(char* uri, char* response_data, size_t data_size){
+    if (data_size > MAX_OBJECT_SIZE)
+        return NULL;
+    Node_t* new_node = (Node_t*)malloc(sizeof(Node_t));
+    if (new_node==NULL){
+        fprintf(stderr,"메모리 할당 오류\n");
+        return NULL;
+    }
+    strcpy(new_node->uri, uri);
+    memcpy(new_node->response_data,&response_data,data_size);
+    new_node->data_size = data_size;
+    new_node->prev = NULL;
+    new_node->next = NULL;
+    return new_node;
+}
 
 // ====================== 함수 선언부 =======================================
 void doit(int fd);
@@ -11,12 +44,19 @@ void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longms
 void parse_uri(char *uri, char *hostname, char *host_uri, char* server_port);
 
 void *thread(void *vargp);
+// =======3번용 함수=================
+void initialize_list(mylist* list);
+void prepend(mylist* list, char* uri, char *response_data, size_t data_size);
+void free_list(mylist* list, size_t data_size, int data);
+void mv_pre(mylist* list, Node_t* node);
+Node_t* find_node(mylist* list, const char* uri);
 // =======================================================================
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr =
     "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 "
     "Firefox/10.0.3\r\n";
+static mylist list;
 
 int main(int argc, char **argv) {
   //----------------------------------------------------------------------------------------------------------
@@ -34,6 +74,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "usage: %s <port>\n", argv[0]);                                   // 아ㅋㅋ 포트없으면 못쓴다고
     exit(1);                                                                          // 강종
   }
+  initialize_list(&list);
   listenfd = Open_listenfd(argv[1]);                                                  // 리스닝소켓을 만들기 위해서 ./proxy입력시에 받은 포트번호를 통해서 열어준다.
   while (1) {
     //---------------문제 1번 ------------------------------------------------------------------------------------
@@ -67,6 +108,8 @@ void * thread(void *vargp){
 }
 
 void doit(int fd) {
+  int is_static;  
+  struct stat sbuf;
   char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
   char hostname[MAXLINE], host_uri[MAXLINE], host_port[MAXLINE];
 
@@ -92,6 +135,14 @@ void doit(int fd) {
 
   int clientfd = Open_clientfd(hostname, host_port);                                  // 서버로 보내야 하는 fd를 연다. clientfd로 지은 이유는 서버입장에서 proxy가 클라이기 때문이다.
 
+  Node_t* node;
+  if ((node = find_node(&list, uri)) != NULL){
+    Rio_writen(clientfd,node->response_data,node->data_size);
+    Close(clientfd);
+    mv_pre(&list,node);
+    return;
+  }
+
   char request_buf[MAXBUF], response_buf[MAXBUF];  
 
   //-----------------------------------헤더---------------------
@@ -105,6 +156,7 @@ void doit(int fd) {
   
   //캐시에 있는지 확인하는 함수
 
+
   // Rio_readlineb 사용
   Rio_readinitb(&response_rio, clientfd);                                             // clientfd를 rio와 연결 후 읽기전 초기화
 
@@ -112,8 +164,12 @@ void doit(int fd) {
   int n;
   while ((n = Rio_readlineb(&response_rio, response_buf, MAXLINE)) > 0) {             // response_rio를 MAXLINE만큼 읽어 response_buf에 저장할때 정보가 없다면 넘김
     Rio_writen(fd, response_buf, n);                                                  // 정보가 있다면 fd 에 적어서 보낸다.
+    if (list.total_data_size >= MAX_CACHE_SIZE){
+      free_list(&list, sizeof(response_buf),0);
+    }
+    prepend(&list, uri, response_buf, strlen(response_buf));
   }
-  Close(clientfd);                                                                     // 다 읽었으니 clientfd를 닫아준다.
+  Close(clientfd);                                                                    // 다 읽었으니 clientfd를 닫아준다.
 }
 
 void parse_uri(char *uri, char *hostname, char *host_uri, char* server_port) {
@@ -152,4 +208,93 @@ void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longms
   sprintf(buf, "Content-length: %d\r\n\r\n", (int)strlen(body));
   Rio_writen(fd, buf, strlen(buf));
   Rio_writen(fd, body, strlen(body));
+}
+
+void initialize_list(mylist* list){
+  list->head = NULL;
+  list->tail = NULL;
+  list->total_data_size = 0;
+}
+
+void prepend(mylist* list, char* uri, char *response_data, size_t data_size){
+    if(data_size > MAX_OBJECT_SIZE){
+      printf("102400초과");
+      return;
+    }
+    Node_t* new_node = createNode(uri, response_data, data_size);
+    if (new_node == NULL){
+      printf("메모리 할당 실패");
+      return;
+    }
+    if (list->head==NULL){
+        list->head = new_node;
+        list->tail = new_node;
+    } else {
+        new_node->next = list -> head;
+        list -> head -> prev = new_node;
+        list->head = new_node;
+    }
+};
+
+void mv_pre(mylist* list, Node_t* node){
+    if (node == list->head)
+        return;
+
+    if (node->prev != NULL)
+        node->prev->next = node->next;
+
+    if (node->next != NULL)
+        node->next->prev = node->prev;
+
+    node->prev = NULL;
+    node->next = list->head;
+
+    if (list->head != NULL)
+        list->head->prev = node;
+
+    list->head = node;
+    if (list->tail == node)
+        list->tail = node->next;
+}
+
+void free_list(mylist *list, size_t data_size, int data) {
+    Node_t *current = list->tail;
+
+    if (data == 0) {
+        // If data is 0, delete data_size amount of data
+        while (current != NULL && data_size > 0) {
+            size_t current_size = current->data_size;
+
+            if (current->data_size >= data_size) {
+                current->data_size -= data_size;
+                data_size = 0;
+            } else {
+                data_size -= current_size;
+            }
+
+            Node_t *temp = current;
+            current = current->prev;
+            free(temp);
+        }
+    } else if (data == 1) {
+        // If data is 1, delete all data
+        while (current != NULL) {
+            Node_t *temp = current;
+            current = current->prev;
+            free(temp);
+        }
+    } else {
+        printf("Invalid data value. Please use 0 or 1.\n");
+    }
+}
+
+Node_t* find_node(mylist* list, const char* uri){
+  Node_t* current = list->head;
+  while (current != NULL){
+    if (strcmp(current->uri, uri)==0){
+      return current;
+    }
+    current = current->next;
+  }
+  return NULL;
 }
